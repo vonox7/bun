@@ -1,31 +1,11 @@
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
-import { bunEnv, bunExe } from "harness";
-
-// Echoes stdin to stdout until it is killed.
-function echo() {
-  return Bun.spawn({
-    cmd: [bunExe(), "-e", "process.stdin.pipe(process.stdout)"],
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "inherit",
-    env: bunEnv,
-  });
-}
-
-async function roundTrip(proc: ReturnType<typeof echo>) {
-  const reader = proc.stdout.getReader();
-  proc.stdin.write("ping\n");
-  proc.stdin.flush();
-  const { value } = await reader.read();
-  reader.releaseLock();
-  return new TextDecoder().decode(value);
-}
+import { echo, type EchoProcess, roundTrip } from "./process-kill-helpers";
 
 // Bun tracks this one under --isolate and --parallel.
 const fromTopOfFile = echo();
-let fromBeforeAll: ReturnType<typeof echo>;
-let fromBeforeEach: ReturnType<typeof echo> | undefined;
-let own: ReturnType<typeof echo>;
+let fromBeforeAll: EchoProcess;
+let fromBeforeEach: EchoProcess | undefined;
+let own: EchoProcess;
 
 beforeAll(() => {
   fromBeforeAll = echo();

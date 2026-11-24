@@ -106,6 +106,10 @@ pub(crate) struct ConcurrentGroup {
     pub(crate) failure_skip_to: usize,
     /// Like `ExecutionSequence::pending_matchers`, for matchers whose calling sequence isn't known.
     pub(crate) pending_matchers: Cell<u32>,
+    /// The auto-killer's mark when the group started.
+    auto_killer_mark: Cell<u64>,
+    /// A test in this group of concurrent tests timed out: kill what the group spawned when it completes.
+    timed_out: Cell<bool>,
 }
 
 impl ConcurrentGroup {
@@ -118,6 +122,8 @@ impl ConcurrentGroup {
             failure_skip_to: next_index,
             next_sequence_index: Cell::new(0),
             pending_matchers: Cell::new(0),
+            auto_killer_mark: Cell::new(0),
+            timed_out: Cell::new(false),
         }
     }
 
@@ -155,6 +161,8 @@ pub(crate) struct ExecutionSequence {
     started_at: Cell<Timespec>,
     /// The auto-killer's mark when the active entry (a hook or the test) started: its timeout kills only the processes spawned since.
     auto_killer_mark: Cell<u64>,
+    /// The auto-killer's mark when this attempt started. A timed-out `afterEach` kills the processes spawned since.
+    attempt_auto_killer_mark: Cell<u64>,
     /// Number of expect() calls observed in this sequence.
     pub(crate) expect_call_count: Cell<u32>,
     /// Expectation set by expect.hasAssertions() or expect.assertions(n).
@@ -193,6 +201,7 @@ impl ExecutionSequence {
             executing: Cell::new(false),
             started_at: Cell::new(Timespec::EPOCH),
             auto_killer_mark: Cell::new(0),
+            attempt_auto_killer_mark: Cell::new(0),
             expect_call_count: Cell::new(0),
             expect_assertions: Cell::new(ExpectAssertions::NotSet),
             maybe_skip: Cell::new(false),
@@ -337,11 +346,23 @@ impl ExecutionSequence {
         }
     }
 
+    /// Where a timeout of `entry` starts killing: an after-hook also kills what the matching setup spawned, which it often waits on.
+    fn kill_mark(&self, buntest: &BunTest, entry: SequenceEntryId) -> u64 {
+        let item = buntest.entry_of(entry);
+        if item.tears_down_scope
+            && let Some(mark) = item.base.parent.and_then(|scope| buntest.scope(scope).auto_killer_mark.get())
+        {
+            return mark;
+        }
+        if self.test_entry.is_some() && !self.test_is_at_or_after(buntest, Some(entry)) {
+            return self.attempt_auto_killer_mark.get();
+        }
+        self.auto_killer_mark.get()
+    }
+
     fn evaluate_timeout(&self, buntest: &BunTest, id: SequenceEntryId, now: &Timespec) -> bool {
         let sequence_entry = buntest.sequence_entry(id);
-        let timespec = sequence_entry.timespec.get();
-        if !timespec.eql(&Timespec::EPOCH) && timespec.order(now) == core::cmp::Ordering::Less {
-            // timed out
+        if deadline_passed(sequence_entry.timespec.get(), now) {
             let entry = buntest.entry(sequence_entry.entry);
             let has_done_parameter = entry.calling == Calling::Jest { done: true };
             self.result.set(if entry.around.is_some() {
@@ -471,28 +492,38 @@ impl Execution {
 
     /// The kill-only half of [`BunTest::handle_timeout`]: reaps a timed-out test's spawned processes without touching the runner's queue, so it may run from inside `spawnSync`'s isolated loop.
     pub(crate) fn kill_dangling_processes_on_timeout(buntest: &BunTest, global_this: &JSGlobalObject) {
-        // if the concurrent group has one sequence and the sequence has an active entry that has timed out,
-        //   kill the processes spawned since that entry started (#46373)
-        // when using test.concurrent(), we can't do this because it could kill multiple tests at once.
+        // Only a group with one sequence: in a concurrent group the processes can't be told apart, so `step_group` kills them at its end.
         if let Some(current_group) = buntest.execution.active_group() {
             let sequences = current_group.sequences(&buntest.execution);
             if sequences.len() == 1 {
                 let sequence = &sequences[0];
                 if let Some(entry) = sequence.active_entry.get() {
                     let now = Timespec::now_force_real_time();
-                    if buntest.sequence_entry(entry).timespec.get().order(&now) == core::cmp::Ordering::Less {
-                        Execution::kill_spawned_since_entry_start(global_this, sequence);
+                    if deadline_passed(buntest.sequence_entry(entry).timespec.get(), &now) {
+                        Execution::kill_spawned_since(global_this, sequence.kill_mark(buntest, entry));
                     }
                 }
             }
         }
     }
 
-    fn kill_spawned_since_entry_start(global_this: &JSGlobalObject, sequence: &ExecutionSequence) {
-        let kill_count = global_this
-            .bun_vm()
-            .auto_killer
-            .kill_spawned_since(sequence.auto_killer_mark.get());
+    /// Kills the processes that a timed-out entry is responsible for. In a group of concurrent tests that waits until the group completes.
+    fn kill_timed_out(
+        buntest: &BunTest,
+        global_this: &JSGlobalObject,
+        group: &ConcurrentGroup,
+        sequence: &ExecutionSequence,
+        entry: SequenceEntryId,
+    ) {
+        if group.sequences(&buntest.execution).len() == 1 {
+            Execution::kill_spawned_since(global_this, sequence.kill_mark(buntest, entry));
+        } else {
+            group.timed_out.set(true);
+        }
+    }
+
+    fn kill_spawned_since(global_this: &JSGlobalObject, mark: u64) {
+        let kill_count = global_this.bun_vm().auto_killer.kill_spawned_since(mark);
         if kill_count.processes > 0 {
             bun_core::pretty_errorln!(
                 "<d>killed {} dangling process{}<r>",
@@ -854,6 +885,7 @@ impl Execution {
             executing: _,
             started_at,
             auto_killer_mark: _,
+            attempt_auto_killer_mark: _,
             expect_call_count,
             expect_assertions,
             maybe_skip,
@@ -960,6 +992,7 @@ fn step_group(
         };
         if !group.executing.replace(true) {
             Execution::on_group_started(global_this);
+            group.auto_killer_mark.set(global_this.bun_vm().auto_killer.mark());
         }
 
         // loop over items in the group and advance their execution
@@ -987,6 +1020,9 @@ fn step_group(
             ExpectDeferred::group_timed_out(buntest, global_this, this.group_index.get());
         }
         group.executing.set(false);
+        if group.timed_out.take() {
+            Execution::kill_spawned_since(global_this, group.auto_killer_mark.get());
+        }
         Execution::on_group_completed(global_this);
 
         // if there is one sequence and it failed, skip to the next group
@@ -1106,9 +1142,7 @@ fn step_sequence_one(
         };
         if sequence.evaluate_timeout(buntest, active_entry, now) {
             // The runner can see the timeout before the timer does, and then the timer kills nothing.
-            if group.sequences(&buntest.execution).len() == 1 {
-                Execution::kill_spawned_since_entry_start(global_this, sequence);
-            }
+            Execution::kill_timed_out(buntest, global_this, group, sequence, active_entry);
             if let Some(context) = sequence.context.get() {
                 TestContext::abort_signal(context, global_this);
             }
@@ -1143,11 +1177,20 @@ fn step_sequence_one(
     let next_entry = buntest.sequence_entry(next_id);
     let next_item = buntest.entry(next_entry.entry);
     sequence.executing.set(true);
+    let mark = global_this.bun_vm().auto_killer.mark();
     // The first entry becomes active again after its fixture setup entries, so `started_at` guards against a second start.
     if Some(next_id) == sequence.first_entry && sequence.started_at.get().eql(&Timespec::EPOCH) {
+        sequence.attempt_auto_killer_mark.set(mark);
         Execution::on_sequence_started(buntest, global_this, sequence);
     }
-    sequence.auto_killer_mark.set(global_this.bun_vm().auto_killer.mark());
+    sequence.auto_killer_mark.set(mark);
+    // Outer scopes of a marked scope are marked already.
+    for scope in buntest.scopes_from(next_item.base.parent) {
+        if scope.auto_killer_mark.get().is_some() {
+            break;
+        }
+        scope.auto_killer_mark.set(Some(mark));
+    }
     Execution::on_entry_started(next_entry, next_item);
     if next_item.added_in_phase == AddedInPhase::Preload {
         bun_jsc::compiled_program::will_run_preloads(global_this);
@@ -1261,9 +1304,7 @@ fn step_sequence_one(
         {
             *now = Timespec::now_force_real_time();
             if sequence.evaluate_timeout(buntest, next_id, now) {
-                if group.sequences(&buntest.execution).len() == 1 {
-                    Execution::kill_spawned_since_entry_start(global_this, sequence);
-                }
+                Execution::kill_timed_out(buntest, global_this, group, sequence, next_id);
                 if let Some(context) = context {
                     TestContext::abort_signal(context, global_this);
                 }
@@ -1295,4 +1336,9 @@ fn step_sequence_one(
         Execution::advance_sequence(buntest, sequence, group);
         return Ok(None); // run again
     }
+}
+
+/// Whether `deadline` is set (not `EPOCH`, which means no timeout) and lies before `now`.
+fn deadline_passed(deadline: Timespec, now: &Timespec) -> bool {
+    !deadline.eql(&Timespec::EPOCH) && deadline.order(now) == core::cmp::Ordering::Less
 }
